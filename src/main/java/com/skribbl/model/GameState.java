@@ -2,6 +2,7 @@ package com.skribbl.model;
 
 import lombok.Data;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 @Data
@@ -21,6 +22,9 @@ public class GameState {
     private int maxHints;
     private int correctGuessCount;
 
+    // ── NEW: tracks which letter positions have been revealed ──
+    private List<Integer> revealedHintIndices;
+
     public GameState() {
         this.phase = GamePhase.LOBBY;
         this.currentRound = 0;
@@ -31,8 +35,22 @@ public class GameState {
         this.hintsRevealed = 0;
         this.maxHints = 3;
         this.correctGuessCount = 0;
+        this.revealedHintIndices = new ArrayList<>();
     }
 
+    /**
+     * Resets hint state for a new round/turn.
+     * Called from GameService.sendWordSelection().
+     */
+    public void resetHintState() {
+        this.hintsRevealed = 0;
+        this.revealedHintIndices.clear();
+    }
+
+    /**
+     * Generates the initial hint: all letters replaced with underscores,
+     * spaces preserved.
+     */
     public String generateHint() {
         if (currentWord == null) return "";
         StringBuilder hint = new StringBuilder();
@@ -46,38 +64,45 @@ public class GameState {
         return hint.toString().trim();
     }
 
-    public String generatePartialHint(int revealCount) {
+    /**
+     * Reveals letters incrementally. Previously revealed letters are
+     * always preserved — new letters are added on top.
+     *
+     * @param totalToReveal cumulative count of letters that should
+     *                      be visible (e.g. 1 on first hint, 2 on second)
+     */
+    public String generatePartialHint(int totalToReveal) {
         if (currentWord == null) return "";
-        char[] hintChars = new char[currentWord.length()];
-        boolean[] revealed = new boolean[currentWord.length()];
 
-        for (int i = 0; i < currentWord.length(); i++) {
-            if (currentWord.charAt(i) == ' ') {
-                hintChars[i] = ' ';
-                revealed[i] = true;
-            } else {
-                hintChars[i] = '_';
-                revealed[i] = false;
-            }
-        }
-
+        // ── Find indices that are still hidden ────────────────
         List<Integer> hiddenIndices = new ArrayList<>();
         for (int i = 0; i < currentWord.length(); i++) {
-            if (!revealed[i]) {
+            if (currentWord.charAt(i) != ' ' && !revealedHintIndices.contains(i)) {
                 hiddenIndices.add(i);
             }
         }
 
-        java.util.Collections.shuffle(hiddenIndices);
-        int toReveal = Math.min(revealCount, hiddenIndices.size());
-        for (int i = 0; i < toReveal; i++) {
-            hintChars[hiddenIndices.get(i)] = currentWord.charAt(hiddenIndices.get(i));
+        // ── Reveal NEW indices (on top of previously revealed) ─
+        Collections.shuffle(hiddenIndices);
+        int newToReveal = Math.min(
+                totalToReveal - revealedHintIndices.size(),
+                hiddenIndices.size()
+        );
+        for (int i = 0; i < Math.max(0, newToReveal); i++) {
+            revealedHintIndices.add(hiddenIndices.get(i));
         }
 
+        // ── Build hint string ──────────────────────────────────
         StringBuilder result = new StringBuilder();
-        for (int i = 0; i < hintChars.length; i++) {
-            result.append(hintChars[i]);
-            if (i < hintChars.length - 1) result.append(' ');
+        for (int i = 0; i < currentWord.length(); i++) {
+            if (currentWord.charAt(i) == ' ') {
+                result.append(' ');
+            } else if (revealedHintIndices.contains(i)) {
+                result.append(currentWord.charAt(i));
+            } else {
+                result.append('_');
+            }
+            if (i < currentWord.length() - 1) result.append(' ');
         }
         return result.toString();
     }

@@ -9,12 +9,12 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class WordService {
 
     private List<String> words = new ArrayList<>();
-    private final Random random = new Random();
 
     @PostConstruct
     public void loadWords() {
@@ -28,6 +28,8 @@ public class WordService {
             for (List<String> categoryWords : wordMap.values()) {
                 words.addAll(categoryWords);
             }
+            // Make the base list unmodifiable after loading
+            words = Collections.unmodifiableList(words);
         } catch (IOException e) {
             words = List.of(
                     "apple", "banana", "car", "dog", "elephant",
@@ -50,8 +52,9 @@ public class WordService {
     }
 
     public List<String> getRandomWords(int count) {
+        // Create a mutable copy, shuffle with thread-safe random
         List<String> shuffled = new ArrayList<>(words);
-        Collections.shuffle(shuffled, random);
+        Collections.shuffle(shuffled, ThreadLocalRandom.current());
         return shuffled.subList(0, Math.min(count, shuffled.size()));
     }
 }

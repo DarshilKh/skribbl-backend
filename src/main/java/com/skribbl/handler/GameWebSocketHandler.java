@@ -45,32 +45,37 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         Map<String, Object> payload = msg.getPayload() != null ? msg.getPayload() : new HashMap<>();
 
         switch (type) {
-            case "create_room" -> handleCreateRoom(session, payload);
-            case "join_room" -> handleJoinRoom(session, payload);
-            case "start_game" -> handleStartGame(session);
-            case "word_chosen" -> handleWordChosen(session, payload);
-            case "draw_data" -> handleDrawData(session, payload);
-            case "canvas_clear" -> handleCanvasClear(session);
-            case "draw_undo" -> handleDrawUndo(session);
-            case "guess" -> handleGuess(session, payload);
-            case "chat" -> handleChat(session, payload);
-            case "get_public_rooms" -> handleGetPublicRooms(session);
-            case "kick_player" -> handleKickPlayer(session, payload);
+            case "create_room"     -> handleCreateRoom(session, payload);
+            case "join_room"       -> handleJoinRoom(session, payload);
+            case "leave_room"      -> handleLeaveRoom(session);
+            case "start_game"      -> handleStartGame(session);
+            case "word_chosen"     -> handleWordChosen(session, payload);
+            case "draw_data"       -> handleDrawData(session, payload);
+            case "canvas_clear"    -> handleCanvasClear(session);
+            case "draw_undo"       -> handleDrawUndo(session);
+            case "guess"           -> handleGuess(session, payload);
+            case "chat"            -> handleChat(session, payload);
+            case "get_public_rooms"-> handleGetPublicRooms(session);
+            case "kick_player"     -> handleKickPlayer(session, payload);
             case "update_settings" -> handleUpdateSettings(session, payload);
-            default -> sendError(session, "Unknown message type: " + type);
+            default                -> sendError(session, "Unknown message type: " + type);
         }
     }
 
-    private void handleCreateRoom(WebSocketSession session, Map<String, Object> payload) throws IOException {
-        String hostName = (String) payload.getOrDefault("hostName", "Host");
-        boolean isPrivate = (boolean) payload.getOrDefault("isPrivate", false);
-        int maxPlayers = ((Number) payload.getOrDefault("maxPlayers", 8)).intValue();
-        int rounds = ((Number) payload.getOrDefault("rounds", 3)).intValue();
-        int drawTime = ((Number) payload.getOrDefault("drawTime", 80)).intValue();
-        int wordCount = ((Number) payload.getOrDefault("wordCount", 3)).intValue();
-        int maxHints = ((Number) payload.getOrDefault("maxHints", 3)).intValue();
+    // ── Room lifecycle ───────────────────────────────────────────
 
-        Room room = roomService.createRoom(hostName, session, isPrivate, maxPlayers, rounds, drawTime, wordCount, maxHints);
+    private void handleCreateRoom(WebSocketSession session, Map<String, Object> payload) throws IOException {
+        String hostName = getStringOrDefault(payload, "hostName", "Host");
+        boolean isPrivate = getBooleanOrDefault(payload, "isPrivate", false);
+        int maxPlayers = getIntOrDefault(payload, "maxPlayers", 8);
+        int rounds = getIntOrDefault(payload, "rounds", 3);
+        int drawTime = getIntOrDefault(payload, "drawTime", 80);
+        int wordCount = getIntOrDefault(payload, "wordCount", 3);
+        int maxHints = getIntOrDefault(payload, "maxHints", 3);
+
+        Room room = roomService.createRoom(
+                hostName, session, isPrivate, maxPlayers, rounds, drawTime, wordCount, maxHints
+        );
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("roomId", room.getId());
@@ -82,8 +87,8 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
     }
 
     private void handleJoinRoom(WebSocketSession session, Map<String, Object> payload) throws IOException {
-        String roomId = ((String) payload.getOrDefault("roomId", "")).toUpperCase().trim();
-        String playerName = (String) payload.getOrDefault("playerName", "Player");
+        String roomId = getStringOrDefault(payload, "roomId", "").toUpperCase().trim();
+        String playerName = getStringOrDefault(payload, "playerName", "Player");
 
         Room room = roomService.joinRoom(roomId, playerName, session);
         if (room == null) {
@@ -110,6 +115,23 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         gameService.sendToAllExcept(room, playerId, "player_joined", broadcast);
     }
 
+    /**
+     * Explicit leave — the player chose to leave.
+     * Delegates to the same cleanup path as an unexpected disconnect.
+     * afterConnectionClosed will also fire when the socket closes,
+     * so handleDisconnect MUST be idempotent.
+     */
+    private void handleLeaveRoom(WebSocketSession session) {
+        roomService.handleDisconnect(session);
+        try {
+            if (session.isOpen()) {
+                session.close(CloseStatus.NORMAL);
+            }
+        } catch (IOException ignored) {}
+    }
+
+    // ── Game actions ─────────────────────────────────────────────
+
     private void handleStartGame(WebSocketSession session) {
         String roomId = roomService.getRoomIdBySession(session.getId());
         String playerId = roomService.getPlayerIdBySession(session.getId());
@@ -133,10 +155,9 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("message", "Game starting!");
-        gameService.sendToAll(room, "game_starting", payload);
-
+        Map<String, Object> startPayload = new LinkedHashMap<>();
+        startPayload.put("message", "Game starting!");
+        gameService.sendToAll(room, "game_starting", startPayload);
         gameService.startGame(room);
     }
 
@@ -148,7 +169,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         Room room = roomService.getRoom(roomId);
         if (room == null) return;
 
-        String word = (String) payload.getOrDefault("word", "");
+        String word = getStringOrDefault(payload, "word", "");
         gameService.handleWordChosen(room, playerId, word);
     }
 
@@ -193,7 +214,7 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         Room room = roomService.getRoom(roomId);
         if (room == null) return;
 
-        String text = (String) payload.getOrDefault("text", "");
+        String text = getStringOrDefault(payload, "text", "");
         if (text.isBlank()) return;
 
         gameService.handleGuess(room, playerId, text);
@@ -207,8 +228,18 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         Room room = roomService.getRoom(roomId);
         if (room == null) return;
 
-        String text = (String) payload.getOrDefault("text", "");
+        String text = getStringOrDefault(payload, "text", "");
         if (text.isBlank()) return;
+
+        // ── Prevent drawer from leaking the word in chat ─────
+        GameState state = room.getGameState();
+        if (state.getPhase() == GamePhase.DRAWING
+                && playerId.equals(state.getCurrentDrawerId())
+                && state.getCurrentWord() != null
+                && text.toLowerCase().contains(state.getCurrentWord().toLowerCase())) {
+            sendError(session, "You can't type the word in chat!");
+            return;
+        }
 
         Player player = room.getPlayers().get(playerId);
 
@@ -220,6 +251,8 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         chatPayload.put("isClose", false);
         gameService.sendToAll(room, "chat_message", chatPayload);
     }
+
+    // ── Room management ──────────────────────────────────────────
 
     private void handleGetPublicRooms(WebSocketSession session) {
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -240,8 +273,8 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
-        String targetId = (String) payload.getOrDefault("targetId", "");
-        if (targetId.equals(room.getHostId())) return;
+        String targetId = getStringOrDefault(payload, "targetId", "");
+        if (targetId.isEmpty() || targetId.equals(room.getHostId())) return;
 
         Player target = room.getPlayers().get(targetId);
         if (target == null) return;
@@ -273,23 +306,26 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         if (room.getGameState().getPhase() != GamePhase.LOBBY) return;
 
         if (payload.containsKey("maxPlayers"))
-            room.setMaxPlayers(Math.max(2, Math.min(20, ((Number) payload.get("maxPlayers")).intValue())));
+            room.setMaxPlayers(clamp(getIntOrDefault(payload, "maxPlayers", 8), 2, 20));
         if (payload.containsKey("rounds"))
-            room.setRounds(Math.max(1, Math.min(10, ((Number) payload.get("rounds")).intValue())));
+            room.setRounds(clamp(getIntOrDefault(payload, "rounds", 3), 1, 10));
         if (payload.containsKey("drawTime"))
-            room.setDrawTime(Math.max(15, Math.min(240, ((Number) payload.get("drawTime")).intValue())));
+            room.setDrawTime(clamp(getIntOrDefault(payload, "drawTime", 80), 15, 240));
         if (payload.containsKey("wordCount"))
-            room.setWordCount(Math.max(1, Math.min(5, ((Number) payload.get("wordCount")).intValue())));
+            room.setWordCount(clamp(getIntOrDefault(payload, "wordCount", 3), 1, 5));
         if (payload.containsKey("maxHints"))
-            room.setMaxHints(Math.max(0, Math.min(5, ((Number) payload.get("maxHints")).intValue())));
+            room.setMaxHints(clamp(getIntOrDefault(payload, "maxHints", 3), 0, 5));
 
         Map<String, Object> settingsPayload = new LinkedHashMap<>();
         settingsPayload.put("settings", getRoomSettings(room));
         gameService.sendToAll(room, "settings_updated", settingsPayload);
     }
 
+    // ── Connection lifecycle ─────────────────────────────────────
+
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        // handleDisconnect is idempotent — safe if leave_room already called it
         roomService.handleDisconnect(session);
     }
 
@@ -297,6 +333,8 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
     public void handleTransportError(WebSocketSession session, Throwable exception) {
         roomService.handleDisconnect(session);
     }
+
+    // ── Helpers ──────────────────────────────────────────────────
 
     private void sendMessage(WebSocketSession session, String type, Map<String, Object> payload) {
         if (session == null || !session.isOpen()) return;
@@ -306,7 +344,10 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
             synchronized (session) {
                 session.sendMessage(new TextMessage(json));
             }
-        } catch (IOException ignored) {}
+        } catch (IOException e) {
+            // Log instead of silently swallowing
+            System.err.println("Failed to send message type=" + type + " : " + e.getMessage());
+        }
     }
 
     private void sendError(WebSocketSession session, String errorMessage) {
@@ -324,5 +365,25 @@ public class GameWebSocketHandler extends TextWebSocketHandler {
         settings.put("maxHints", room.getMaxHints());
         settings.put("isPrivate", room.isPrivate());
         return settings;
+    }
+
+    /** Safe extraction — avoids ClassCastException from Jackson's type mapping */
+    private String getStringOrDefault(Map<String, Object> map, String key, String fallback) {
+        Object val = map.get(key);
+        return val instanceof String s ? s : fallback;
+    }
+
+    private int getIntOrDefault(Map<String, Object> map, String key, int fallback) {
+        Object val = map.get(key);
+        return val instanceof Number n ? n.intValue() : fallback;
+    }
+
+    private boolean getBooleanOrDefault(Map<String, Object> map, String key, boolean fallback) {
+        Object val = map.get(key);
+        return val instanceof Boolean b ? b : fallback;
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 }

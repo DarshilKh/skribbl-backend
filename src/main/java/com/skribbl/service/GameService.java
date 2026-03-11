@@ -18,9 +18,12 @@ public class GameService {
     private final WordService wordService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(10);
+
+    // All timer maps — every scheduled task is tracked and cancellable
     private final Map<String, ScheduledFuture<?>> roomTimers = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> hintTimers = new ConcurrentHashMap<>();
     private final Map<String, ScheduledFuture<?>> countdownTimers = new ConcurrentHashMap<>();
+    private final Map<String, ScheduledFuture<?>> transitionTimers = new ConcurrentHashMap<>();
 
     public GameService(WordService wordService) {
         this.wordService = wordService;
@@ -28,15 +31,15 @@ public class GameService {
 
     @PreDestroy
     public void shutdown() {
-        // Cancel all active timers
         roomTimers.values().forEach(f -> f.cancel(true));
         hintTimers.values().forEach(f -> f.cancel(true));
         countdownTimers.values().forEach(f -> f.cancel(true));
+        transitionTimers.values().forEach(f -> f.cancel(true));
         roomTimers.clear();
         hintTimers.clear();
         countdownTimers.clear();
+        transitionTimers.clear();
 
-        // Shutdown executor gracefully
         scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -47,6 +50,8 @@ public class GameService {
             Thread.currentThread().interrupt();
         }
     }
+
+    // ── Game lifecycle ───────────────────────────────────────────
 
     public void startGame(Room room) {
         GameState state = room.getGameState();
@@ -75,7 +80,7 @@ public class GameService {
         GameState state = room.getGameState();
         state.setPhase(GamePhase.WORD_SELECTION);
         state.setCorrectGuessCount(0);
-        state.setHintsRevealed(0);
+        state.resetHintState(); // ← uses new method instead of just setHintsRevealed(0)
 
         for (Player p : room.getPlayers().values()) {
             p.resetGuess();
@@ -101,6 +106,7 @@ public class GameService {
         othersPayload.put("totalRounds", state.getTotalRounds());
         sendToAllExcept(room, drawerId, "choosing_word", othersPayload);
 
+        // Auto-select after 15 seconds if drawer hasn't chosen
         ScheduledFuture<?> autoSelect = scheduler.schedule(() -> {
             if (state.getPhase() == GamePhase.WORD_SELECTION) {
                 List<String> fallback = wordService.getRandomWords(1);
@@ -123,6 +129,7 @@ public class GameService {
         state.setRoundStartTime(System.currentTimeMillis());
         state.setRoundEndTime(System.currentTimeMillis() + (state.getDrawTime() * 1000L));
 
+        // Tell the drawer
         Map<String, Object> drawerPayload = new LinkedHashMap<>();
         drawerPayload.put("word", state.getCurrentWord());
         drawerPayload.put("drawTime", state.getDrawTime());
@@ -131,6 +138,7 @@ public class GameService {
         drawerPayload.put("hint", state.getCurrentWord().replaceAll("[^ ]", "_ ").trim());
         sendToPlayer(room, state.getCurrentDrawerId(), "round_start_drawer", drawerPayload);
 
+        // Tell everyone else
         Map<String, Object> guesserPayload = new LinkedHashMap<>();
         guesserPayload.put("hint", state.getCurrentHint());
         guesserPayload.put("drawTime", state.getDrawTime());
@@ -146,6 +154,8 @@ public class GameService {
         startHintTimer(room);
         startCountdownBroadcast(room);
     }
+
+    // ── Timers ───────────────────────────────────────────────────
 
     private void startRoundTimer(Room room) {
         cancelTimer(room.getId() + "_round");
@@ -196,6 +206,8 @@ public class GameService {
         hintTimers.put(room.getId() + "_hint", timer);
     }
 
+    // ── Guessing ─────────────────────────────────────────────────
+
     public void handleGuess(Room room, String playerId, String guess) {
         GameState state = room.getGameState();
         if (state.getPhase() != GamePhase.DRAWING) return;
@@ -208,13 +220,14 @@ public class GameService {
         String currentWord = state.getCurrentWord().toLowerCase();
 
         if (normalizedGuess.equals(currentWord)) {
+            // ── Correct guess ────────────────────────────────────
             player.setHasGuessedCorrectly(true);
             state.setCorrectGuessCount(state.getCorrectGuessCount() + 1);
             player.setGuessOrder(state.getCorrectGuessCount());
 
             long elapsed = System.currentTimeMillis() - state.getRoundStartTime();
             long totalTime = state.getDrawTime() * 1000L;
-            double timeRatio = 1.0 - ((double) elapsed / totalTime);
+            double timeRatio = Math.max(0, 1.0 - ((double) elapsed / totalTime));
             int basePoints = (int) (500 * timeRatio) + 100;
             int orderBonus = Math.max(0, 200 - (state.getCorrectGuessCount() - 1) * 50);
             int points = basePoints + orderBonus;
@@ -222,7 +235,7 @@ public class GameService {
 
             Player drawer = room.getPlayers().get(state.getCurrentDrawerId());
             if (drawer != null) {
-                drawer.addScore(50 + (int)(100 * timeRatio));
+                drawer.addScore(50 + (int) (100 * timeRatio));
             }
 
             Map<String, Object> correctPayload = new LinkedHashMap<>();
@@ -232,6 +245,7 @@ public class GameService {
             correctPayload.put("players", room.getPlayerList());
             sendToAll(room, "correct_guess", correctPayload);
 
+            // Check if everyone has guessed
             long nonDrawerCount = room.getPlayers().entrySet().stream()
                     .filter(e -> !e.getKey().equals(state.getCurrentDrawerId()))
                     .count();
@@ -240,6 +254,7 @@ public class GameService {
                 endRound(room, true);
             }
         } else {
+            // ── Wrong guess ──────────────────────────────────────
             boolean isClose = isCloseGuess(normalizedGuess, currentWord);
 
             Map<String, Object> chatPayload = new LinkedHashMap<>();
@@ -280,113 +295,165 @@ public class GameService {
         return dp[a.length()][b.length()];
     }
 
-    public synchronized void endRound(Room room, boolean allGuessed) {
-        GameState state = room.getGameState();
-        if (state.getPhase() == GamePhase.ROUND_END || state.getPhase() == GamePhase.GAME_OVER) return;
+    // ── Round / Game end ─────────────────────────────────────────
 
-        state.setPhase(GamePhase.ROUND_END);
-        cancelTimer(room.getId() + "_round");
-        cancelTimer(room.getId() + "_hint");
-        cancelTimer(room.getId() + "_countdown");
+    /**
+     * Ends the current round.
+     * Synchronized per-room via the room object to prevent concurrent
+     * timer + disconnect from double-ending the same round, while
+     * allowing different rooms to proceed independently.
+     */
+    public void endRound(Room room, boolean allGuessed) {
+        synchronized (room) {
+            GameState state = room.getGameState();
+            if (state.getPhase() == GamePhase.ROUND_END ||
+                    state.getPhase() == GamePhase.GAME_OVER) {
+                return;
+            }
 
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("word", state.getCurrentWord());
-        payload.put("players", room.getPlayerList());
-        payload.put("allGuessed", allGuessed);
-        payload.put("round", state.getCurrentRound());
-        payload.put("totalRounds", state.getTotalRounds());
-        sendToAll(room, "round_end", payload);
+            state.setPhase(GamePhase.ROUND_END);
+            cancelTimer(room.getId() + "_round");
+            cancelTimer(room.getId() + "_hint");
+            cancelTimer(room.getId() + "_countdown");
 
-        scheduler.schedule(() -> nextTurn(room), 5, TimeUnit.SECONDS);
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("word", state.getCurrentWord());
+            payload.put("players", room.getPlayerList());
+            payload.put("allGuessed", allGuessed);
+            payload.put("round", state.getCurrentRound());
+            payload.put("totalRounds", state.getTotalRounds());
+            sendToAll(room, "round_end", payload);
+
+            // Track the transition timer so it can be cancelled on cleanup
+            ScheduledFuture<?> transition = scheduler.schedule(
+                    () -> nextTurn(room), 5, TimeUnit.SECONDS
+            );
+            transitionTimers.put(room.getId() + "_transition", transition);
+        }
     }
 
     private void nextTurn(Room room) {
-        GameState state = room.getGameState();
-        int nextIndex = state.getCurrentDrawerIndex() + 1;
-
-        if (nextIndex >= state.getDrawerOrder().size()) {
-            if (state.getCurrentRound() >= state.getTotalRounds()) {
+        synchronized (room) {
+            // ── Guard: if players left during the 5s wait ────────
+            if (room.getPlayers().size() < 2) {
                 endGame(room);
                 return;
             }
-            state.setCurrentRound(state.getCurrentRound() + 1);
-            nextIndex = 0;
-        }
 
-        List<String> order = state.getDrawerOrder();
-        while (nextIndex < order.size() && !room.getPlayers().containsKey(order.get(nextIndex))) {
-            nextIndex++;
-        }
+            GameState state = room.getGameState();
+            int nextIndex = state.getCurrentDrawerIndex() + 1;
 
-        if (nextIndex >= order.size()) {
-            if (state.getCurrentRound() >= state.getTotalRounds()) {
-                endGame(room);
-                return;
+            if (nextIndex >= state.getDrawerOrder().size()) {
+                if (state.getCurrentRound() >= state.getTotalRounds()) {
+                    endGame(room);
+                    return;
+                }
+                state.setCurrentRound(state.getCurrentRound() + 1);
+                nextIndex = 0;
             }
-            state.setCurrentRound(state.getCurrentRound() + 1);
-            nextIndex = 0;
-            while (nextIndex < order.size() && !room.getPlayers().containsKey(order.get(nextIndex))) {
+
+            // Skip disconnected players
+            List<String> order = state.getDrawerOrder();
+            while (nextIndex < order.size() &&
+                    !room.getPlayers().containsKey(order.get(nextIndex))) {
                 nextIndex++;
             }
+
             if (nextIndex >= order.size()) {
-                endGame(room);
-                return;
+                if (state.getCurrentRound() >= state.getTotalRounds()) {
+                    endGame(room);
+                    return;
+                }
+                state.setCurrentRound(state.getCurrentRound() + 1);
+                nextIndex = 0;
+                while (nextIndex < order.size() &&
+                        !room.getPlayers().containsKey(order.get(nextIndex))) {
+                    nextIndex++;
+                }
+                if (nextIndex >= order.size()) {
+                    endGame(room);
+                    return;
+                }
             }
+
+            state.setCurrentDrawerIndex(nextIndex);
+            state.setCurrentDrawerId(order.get(nextIndex));
+            room.clearDrawHistory();
+
+            sendWordSelection(room);
         }
-
-        state.setCurrentDrawerIndex(nextIndex);
-        state.setCurrentDrawerId(order.get(nextIndex));
-        room.clearDrawHistory();
-
-        sendWordSelection(room);
     }
 
     private void endGame(Room room) {
-        GameState state = room.getGameState();
-        state.setPhase(GamePhase.GAME_OVER);
+        synchronized (room) {
+            GameState state = room.getGameState();
 
-        cancelTimer(room.getId() + "_round");
-        cancelTimer(room.getId() + "_hint");
-        cancelTimer(room.getId() + "_countdown");
+            // Prevent double-end
+            if (state.getPhase() == GamePhase.GAME_OVER) return;
 
-        List<Map<String, Object>> leaderboard = new ArrayList<>(room.getPlayerList());
-        leaderboard.sort((a, b) -> (int) b.get("score") - (int) a.get("score"));
+            state.setPhase(GamePhase.GAME_OVER);
 
-        String winnerId = leaderboard.isEmpty() ? null : (String) leaderboard.get(0).get("id");
-        String winnerName = leaderboard.isEmpty() ? "Nobody" : (String) leaderboard.get(0).get("name");
+            cancelTimer(room.getId() + "_round");
+            cancelTimer(room.getId() + "_hint");
+            cancelTimer(room.getId() + "_countdown");
+            cancelTimer(room.getId() + "_transition");
 
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("winner", winnerName);
-        payload.put("winnerId", winnerId);
-        payload.put("leaderboard", leaderboard);
-        sendToAll(room, "game_over", payload);
+            List<Map<String, Object>> leaderboard = new ArrayList<>(room.getPlayerList());
+            leaderboard.sort((a, b) -> ((int) b.get("score")) - ((int) a.get("score")));
 
-        scheduler.schedule(() -> {
-            state.setPhase(GamePhase.LOBBY);
-            state.setCurrentRound(0);
-            state.setCurrentDrawerIndex(-1);
-            state.setCurrentDrawerId(null);
-            state.setCurrentWord(null);
-            state.setCurrentHint(null);
-            for (Player p : room.getPlayers().values()) {
-                p.setScore(0);
-                p.resetGuess();
-            }
-            room.clearDrawHistory();
+            String winnerName = leaderboard.isEmpty()
+                    ? "Nobody"
+                    : (String) leaderboard.get(0).get("name");
+            String winnerId = leaderboard.isEmpty()
+                    ? null
+                    : (String) leaderboard.get(0).get("id");
 
-            Map<String, Object> lobbyPayload = new LinkedHashMap<>();
-            lobbyPayload.put("players", room.getPlayerList());
-            lobbyPayload.put("hostId", room.getHostId());
-            sendToAll(room, "return_to_lobby", lobbyPayload);
-        }, 10, TimeUnit.SECONDS);
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("winner", winnerName);
+            payload.put("winnerId", winnerId);
+            payload.put("leaderboard", leaderboard);
+            sendToAll(room, "game_over", payload);
+
+            // Return to lobby after 10 seconds — tracked for cleanup
+            ScheduledFuture<?> returnTimer = scheduler.schedule(() -> {
+                synchronized (room) {
+                    // Room may have been cleaned up during the wait
+                    if (room.getPlayers().isEmpty()) return;
+
+                    state.setPhase(GamePhase.LOBBY);
+                    state.setCurrentRound(0);
+                    state.setCurrentDrawerIndex(-1);
+                    state.setCurrentDrawerId(null);
+                    state.setCurrentWord(null);
+                    state.setCurrentHint(null);
+                    state.resetHintState();
+                    for (Player p : room.getPlayers().values()) {
+                        p.setScore(0);
+                        p.resetGuess();
+                    }
+                    room.clearDrawHistory();
+
+                    Map<String, Object> lobbyPayload = new LinkedHashMap<>();
+                    lobbyPayload.put("players", room.getPlayerList());
+                    lobbyPayload.put("hostId", room.getHostId());
+                    sendToAll(room, "return_to_lobby", lobbyPayload);
+                }
+            }, 10, TimeUnit.SECONDS);
+            transitionTimers.put(room.getId() + "_returnlobby", returnTimer);
+        }
     }
+
+    // ── Drawing ──────────────────────────────────────────────────
 
     public void broadcastDrawData(Room room, String playerId, Map<String, Object> drawData) {
         GameState state = room.getGameState();
         if (!playerId.equals(state.getCurrentDrawerId())) return;
         if (state.getPhase() != GamePhase.DRAWING) return;
 
-        room.getDrawHistory().add(drawData);
+        List<Map<String, Object>> history = room.getDrawHistory();
+        synchronized (history) {
+            history.add(drawData);
+        }
 
         Map<String, Object> payload = new LinkedHashMap<>(drawData);
         payload.put("playerId", playerId);
@@ -406,39 +473,41 @@ public class GameService {
 
         List<Map<String, Object>> history = room.getDrawHistory();
 
-        // FIXED: Safe bounds checking for undo
-        if (history.isEmpty()) return;
+        // ── Synchronize the entire read-modify cycle ─────────
+        synchronized (history) {
+            if (history.isEmpty()) return;
 
-        try {
+            // Walk backward to find the last complete stroke
+            // (draw_start → draw_move* → draw_end)
             for (int i = history.size() - 1; i >= 0; i--) {
-                Map<String, Object> action = history.get(i);
-                String type = (String) action.get("type");
+                String type = (String) history.get(i).get("type");
                 if ("draw_end".equals(type)) {
+                    // Find the matching draw_start
                     int start = i;
                     while (start > 0) {
                         start--;
                         String t = (String) history.get(start).get("type");
                         if ("draw_start".equals(t)) break;
                     }
-                    if (start >= 0 && start < history.size()) {
-                        // Use a safe range: from start to the end of the list
-                        int end = Math.min(i + 1, history.size());
-                        if (start < end) {
-                            history.subList(start, end).clear();
-                        }
+
+                    int end = i + 1;
+                    if (start >= 0 && start < end && end <= history.size()) {
+                        history.subList(start, end).clear();
                     }
                     break;
                 }
             }
-        } catch (Exception e) {
-            // If anything goes wrong, just clear and continue
-            // This prevents crashes from malformed history
         }
 
+        // Build payload from a snapshot
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("drawHistory", new ArrayList<>(history));
+        synchronized (history) {
+            payload.put("drawHistory", new ArrayList<>(history));
+        }
         sendToAllExcept(room, playerId, "draw_undo", payload);
     }
+
+    // ── Messaging ────────────────────────────────────────────────
 
     public void sendToAll(Room room, String type, Map<String, Object> payload) {
         WebSocketMessage msg = new WebSocketMessage(type, payload);
@@ -446,6 +515,7 @@ public class GameService {
         try {
             json = objectMapper.writeValueAsString(msg);
         } catch (IOException e) {
+            System.err.println("Failed to serialize " + type + ": " + e.getMessage());
             return;
         }
         for (WebSocketSession session : room.getSessions().values()) {
@@ -453,12 +523,14 @@ public class GameService {
         }
     }
 
-    public void sendToAllExcept(Room room, String excludeId, String type, Map<String, Object> payload) {
+    public void sendToAllExcept(Room room, String excludeId, String type,
+                                Map<String, Object> payload) {
         WebSocketMessage msg = new WebSocketMessage(type, payload);
         String json;
         try {
             json = objectMapper.writeValueAsString(msg);
         } catch (IOException e) {
+            System.err.println("Failed to serialize " + type + ": " + e.getMessage());
             return;
         }
         for (Map.Entry<String, WebSocketSession> entry : room.getSessions().entrySet()) {
@@ -468,14 +540,16 @@ public class GameService {
         }
     }
 
-    public void sendToPlayer(Room room, String playerId, String type, Map<String, Object> payload) {
+    public void sendToPlayer(Room room, String playerId, String type,
+                             Map<String, Object> payload) {
         WebSocketSession session = room.getSessions().get(playerId);
         if (session == null || !session.isOpen()) return;
-        WebSocketMessage msg = new WebSocketMessage(type, payload);
         try {
-            String json = objectMapper.writeValueAsString(msg);
-            sendRaw(session, json);
-        } catch (IOException ignored) {}
+            WebSocketMessage msg = new WebSocketMessage(type, payload);
+            sendRaw(session, objectMapper.writeValueAsString(msg));
+        } catch (IOException e) {
+            System.err.println("Failed to send " + type + " to " + playerId + ": " + e.getMessage());
+        }
     }
 
     private void sendRaw(WebSocketSession session, String json) {
@@ -484,15 +558,26 @@ public class GameService {
             synchronized (session) {
                 session.sendMessage(new TextMessage(json));
             }
-        } catch (IOException ignored) {}
+        } catch (IOException e) {
+            System.err.println("Failed to send to session: " + e.getMessage());
+        }
     }
 
+    // ── Timer management ─────────────────────────────────────────
+
     private void cancelTimer(String key) {
-        ScheduledFuture<?> timer = roomTimers.remove(key);
+        ScheduledFuture<?> timer;
+
+        timer = roomTimers.remove(key);
         if (timer != null) timer.cancel(false);
+
         timer = hintTimers.remove(key);
         if (timer != null) timer.cancel(false);
+
         timer = countdownTimers.remove(key);
+        if (timer != null) timer.cancel(false);
+
+        timer = transitionTimers.remove(key);
         if (timer != null) timer.cancel(false);
     }
 
@@ -501,5 +586,7 @@ public class GameService {
         cancelTimer(roomId + "_hint");
         cancelTimer(roomId + "_countdown");
         cancelTimer(roomId + "_wordselect");
+        cancelTimer(roomId + "_transition");
+        cancelTimer(roomId + "_returnlobby");
     }
 }
