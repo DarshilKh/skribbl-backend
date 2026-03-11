@@ -1,0 +1,41 @@
+{
+  "animals": [
+    "cat", "dog", "elephant", "giraffe", "lion", "tiger", "penguin", "dolphin",
+    "butterfly", "snake", "rabbit", "horse", "monkey", "bear", "eagle", "shark",
+    "octopus", "kangaroo", "zebra", "owl", "frog", "whale", "parrot", "turtle",
+    "jellyfish", "starfish", "crab", "lobster", "spider", "ant"
+  ],
+  "objects": [
+    "chair", "table", "lamp", "clock", "mirror", "umbrella", "guitar", "piano",
+    "camera", "telephone", "television", "computer", "bicycle", "car", "airplane",
+    "helicopter", "rocket", "submarine", "sword", "shield", "crown", "diamond",
+    "key", "lock", "book", "pencil", "scissors", "hammer", "ladder", "candle"
+  ],
+  "food": [
+    "pizza", "hamburger", "ice cream", "cake", "cookie", "sandwich", "spaghetti",
+    "sushi", "taco", "pancake", "donut", "popcorn", "banana", "apple", "watermelon",
+    "strawberry", "grapes", "pineapple", "coconut", "carrot", "broccoli", "mushroom",
+    "cheese", "bread", "egg", "chocolate", "candy", "pie", "soup", "salad"
+  ],
+  "places": [
+    "beach", "mountain", "forest", "desert", "island", "castle", "lighthouse",
+    "bridge", "volcano", "waterfall", "cave", "garden", "library", "hospital",
+    "school", "church", "stadium", "museum", "zoo", "aquarium", "airport",
+    "train station", "farm", "jungle", "pyramid", "igloo", "tent", "treehouse",
+    "palace", "dungeon"
+  ],
+  "actions": [
+    "swimming", "dancing", "singing", "running", "jumping", "climbing", "fishing",
+    "cooking", "painting", "reading", "sleeping", "flying", "surfing", "skiing",
+    "skateboarding", "juggling", "boxing", "wrestling", "archery", "bowling",
+    "camping", "diving", "hiking", "karate", "yoga", "meditation", "gardening",
+    "knitting", "sailing", "snorkeling"
+  ],
+  "things": [
+    "rainbow", "tornado", "lightning", "snowflake", "sunrise", "sunset", "moon",
+    "star", "cloud", "fire", "treasure", "robot", "ghost", "dragon", "unicorn",
+    "mermaid", "pirate", "ninja", "wizard", "knight", "angel", "vampire",
+    "werewolf", "zombie", "alien", "astronaut", "superhero", "scarecrow",
+    "snowman", "fireworks"
+  ]
+}
